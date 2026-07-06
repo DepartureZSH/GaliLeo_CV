@@ -1,0 +1,4 @@
+version: 1.0.0
+name: GaliLeo_CV
+spec:
+  runtime: node

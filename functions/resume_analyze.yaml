@@ -1,0 +1,5 @@
+name: resume_analyze
+desc: "Validate PDF resume upload and prepare AI analysis"
+methods:
+  - POST
+tags: []

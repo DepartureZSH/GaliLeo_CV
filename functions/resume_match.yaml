@@ -1,0 +1,5 @@
+name: resume_match
+desc: "Validate job description and prepare resume matching"
+methods:
+  - POST
+tags: []

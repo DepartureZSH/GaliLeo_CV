@@ -1,0 +1,5 @@
+name: health
+desc: "Service health check for GaliLeo CV"
+methods:
+  - GET
+tags: []
