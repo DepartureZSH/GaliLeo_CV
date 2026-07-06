@@ -18,6 +18,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      HAS_PAGES_TOKEN: ${{ secrets.PAGES_TOKEN != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,7 +55,15 @@ jobs:
               -exec cp -R {} .pages-dist/ \;
           fi
 
+      - name: Configure Pages with auto-enable token
+        if: env.HAS_PAGES_TOKEN == 'true'
+        uses: actions/configure-pages@v5
+        with:
+          token: ${{ secrets.PAGES_TOKEN }}
+          enablement: true
+
       - name: Configure Pages
+        if: env.HAS_PAGES_TOKEN != 'true'
         uses: actions/configure-pages@v5
 
       - name: Upload artifact
@@ -71,4 +81,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
