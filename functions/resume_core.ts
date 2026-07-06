@@ -1,3 +1,5 @@
+import { createHash } from 'crypto'
+
 export interface ResumeProfile {
   name: string | null
   phone: string | null
@@ -19,6 +21,11 @@ export interface MatchResult {
 }
 
 type FetchLike = typeof fetch
+
+interface RedisLike {
+  get(key: string): Promise<string | null>
+  set(key: string, value: string, mode: 'EX', ttlSeconds: number): Promise<unknown>
+}
 
 interface DeepSeekOptions {
   apiKey: string
@@ -119,6 +126,42 @@ export async function scoreMatchWithDeepSeek(
   return normalizeMatchResult(result)
 }
 
+export function cleanResumeText(text: string) {
+  return text
+    .replace(/\u0000/g, '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/[ \t\f\v]+/g, ' ').trim())
+    .filter((line) => line && !isPageNoise(line))
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+export function buildParseCacheKey(resumeId: string) {
+  return `resume:parse:${resumeId}`
+}
+
+export function buildMatchCacheKey(resumeId: string, jobDescription: string) {
+  const jdHash = createHash('sha256').update(jobDescription).digest('hex')
+  return `resume:match:${resumeId}:${jdHash}`
+}
+
+export async function getCachedJson<T>(redis: RedisLike, key: string) {
+  const value = await redis.get(key)
+  if (!value) return null
+  return JSON.parse(value) as T
+}
+
+export async function setCachedJson(
+  redis: RedisLike,
+  key: string,
+  value: unknown,
+  ttlSeconds: number,
+) {
+  await redis.set(key, JSON.stringify(value), 'EX', ttlSeconds)
+}
+
 export async function callDeepSeekJson(options: DeepSeekOptions) {
   const fetchImpl = options.fetchImpl || fetch
   const response = await fetchImpl(`${trimSlash(options.baseUrl)}/chat/completions`, {
@@ -171,6 +214,12 @@ function requireEnv(env: NodeJS.ProcessEnv, key: string) {
 
 function trimSlash(value: string) {
   return value.replace(/\/+$/, '')
+}
+
+function isPageNoise(line: string) {
+  return /^第\s*\d+\s*页\s*\/\s*共\s*\d+\s*页$/i.test(line)
+    || /^page\s*\d+\s*of\s*\d+$/i.test(line)
+    || /^[-_—=]{3,}$/.test(line)
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

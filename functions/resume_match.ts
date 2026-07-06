@@ -13,13 +13,30 @@ interface ResumeProfile {
   education: Array<Record<string, unknown> | string>
 }
 
+interface MatchResult {
+  score: number
+  matchedKeywords: string[]
+  missingKeywords: string[]
+  summary: string
+}
+
+interface ParsedResumeCache {
+  profile: ResumeProfile
+  resumeText?: string
+}
+
+interface CacheMetadata {
+  enabled: boolean
+  key: string
+  hit?: boolean
+}
+
 export default async function (ctx: FunctionContext) {
   setCorsHeaders(ctx)
 
   const body = normalizeBody(ctx.body)
   const resumeId = String(body.resumeId || '').trim()
   const jobDescription = String(body.jobDescription || '').trim()
-  const profile = getProfile(resumeId, body.profile)
 
   if (!resumeId || !jobDescription) {
     return jsonError(
@@ -41,6 +58,17 @@ export default async function (ctx: FunctionContext) {
 
   const jdHash = createHash('sha256').update(jobDescription).digest('hex')
   const cacheKey = `resume:match:${resumeId}:${jdHash}`
+  const cachedMatch = await getCacheJson<MatchResult>(cacheKey)
+  if (cachedMatch) {
+    return {
+      ok: true,
+      resumeId,
+      ...cachedMatch,
+      cache: getCacheMetadata(cacheKey, true),
+    }
+  }
+
+  const profile = await getProfile(resumeId, body.profile)
   if (!profile) {
     return jsonError(
       ctx,
@@ -58,14 +86,13 @@ export default async function (ctx: FunctionContext) {
     return jsonError(ctx, 502, 'DEEPSEEK_REQUEST_FAILED', 'DeepSeek resume matching failed')
   }
 
+  await setCacheJson(cacheKey, matchResult)
+
   return {
     ok: true,
     resumeId,
     ...matchResult,
-    cache: {
-      enabled: Boolean(process.env.REDIS_URL),
-      key: cacheKey,
-    },
+    cache: getCacheMetadata(cacheKey, false),
   }
 }
 
@@ -91,7 +118,7 @@ function normalizeBody(body: unknown) {
   return (body || {}) as Record<string, unknown>
 }
 
-function getProfile(resumeId: string, bodyProfile: unknown): ResumeProfile | null {
+async function getProfile(resumeId: string, bodyProfile: unknown): Promise<ResumeProfile | null> {
   if (bodyProfile && typeof bodyProfile === 'object') {
     return normalizeProfile(bodyProfile)
   }
@@ -100,7 +127,11 @@ function getProfile(resumeId: string, bodyProfile: unknown): ResumeProfile | nul
     __galileoResumeStore?: Map<string, { profile: ResumeProfile; resumeText: string }>
   }
 
-  return globalStore.__galileoResumeStore?.get(resumeId)?.profile ?? null
+  const memoryProfile = globalStore.__galileoResumeStore?.get(resumeId)?.profile
+  if (memoryProfile) return memoryProfile
+
+  const cachedResume = await getCacheJson<ParsedResumeCache>(`resume:parse:${resumeId}`)
+  return cachedResume?.profile ? normalizeProfile(cachedResume.profile) : null
 }
 
 function jsonError(
@@ -131,14 +162,16 @@ async function scoreMatchWithDeepSeek(
       {
         role: 'system',
         content:
-          '你是招聘匹配评分助手。只返回合法 JSON，不要输出 Markdown。',
+          '你是招聘匹配评分助手。只返回合法 JSON，不要输出 Markdown；评分必须基于证据，不要编造候选人经历。',
       },
       {
         role: 'user',
         content: [
           '请根据候选人简历结构化信息和岗位 JD 输出 JSON。',
           '字段必须包含 score(0-100), matchedKeywords, missingKeywords, summary。',
-          'summary 用中文说明匹配原因，控制在 80 字以内。',
+          'matchedKeywords 只列简历和岗位都明确出现或语义强相关的关键词。',
+          'missingKeywords 列岗位要求但简历未体现的关键词。',
+          'summary 用中文说明匹配原因，控制在 100 字以内。',
           '',
           `简历 JSON：${JSON.stringify(profile)}`,
           '',
@@ -266,4 +299,64 @@ function clampScore(value: unknown) {
   const score = typeof value === 'number' ? value : Number(value)
   if (!Number.isFinite(score)) return 0
   return Math.max(0, Math.min(100, Math.round(score)))
+}
+
+function getCacheMetadata(key: string, hit: boolean): CacheMetadata {
+  return {
+    enabled: Boolean(process.env.REDIS_URL),
+    hit,
+    key,
+  }
+}
+
+async function getCacheJson<T>(key: string) {
+  const redis = getRedisClient()
+  if (!redis) return null
+
+  try {
+    const value = await redis.get(key)
+    return value ? (JSON.parse(value) as T) : null
+  } catch (error) {
+    console.warn('Redis cache read failed', error)
+    return null
+  }
+}
+
+async function setCacheJson(key: string, value: unknown) {
+  const redis = getRedisClient()
+  if (!redis) return
+
+  try {
+    await redis.set(key, JSON.stringify(value), 'EX', getCacheTtlSeconds())
+  } catch (error) {
+    console.warn('Redis cache write failed', error)
+  }
+}
+
+function getRedisClient() {
+  const redisUrl = process.env.REDIS_URL
+  if (!redisUrl) return null
+
+  const globalStore = globalThis as typeof globalThis & {
+    __galileoRedis?: {
+      get(key: string): Promise<string | null>
+      set(key: string, value: string, mode: 'EX', ttlSeconds: number): Promise<unknown>
+    }
+  }
+
+  if (!globalStore.__galileoRedis) {
+    const Redis = require('ioredis')
+    globalStore.__galileoRedis = new Redis(redisUrl, {
+      connectTimeout: 1500,
+      enableOfflineQueue: false,
+      maxRetriesPerRequest: 1,
+    })
+  }
+
+  return globalStore.__galileoRedis
+}
+
+function getCacheTtlSeconds() {
+  const ttl = Number(process.env.REDIS_TTL_SECONDS)
+  return Number.isFinite(ttl) && ttl > 0 ? Math.round(ttl) : 86400
 }

@@ -141,9 +141,17 @@ function App() {
             <ResultRow label="电话" value={analysis?.profile.phone} />
             <ResultRow label="邮箱" value={analysis?.profile.email} />
             <ResultRow label="地址" value={analysis?.profile.address} />
+            <ResultRow label="求职意向" value={analysis?.profile.targetRole} />
+            <ResultRow label="期望薪资" value={analysis?.profile.expectedSalary} />
+            <ResultRow
+              label="工作年限"
+              value={formatYears(analysis?.profile.yearsOfExperience)}
+            />
           </div>
 
           <TagGroup title="技能标签" items={analysis?.profile.skills ?? []} />
+          <TextGroup title="项目经历" items={analysis?.profile.projects ?? []} />
+          <TextGroup title="学历背景" items={analysis?.profile.education ?? []} />
           <TagGroup title="命中关键词" items={match?.matchedKeywords ?? []} />
           <TagGroup title="缺失关键词" items={match?.missingKeywords ?? []} />
 
@@ -181,8 +189,43 @@ function TagGroup({ title, items }: { title: string; items: string[] }) {
   )
 }
 
+function TextGroup({
+  title,
+  items,
+}: {
+  title: string
+  items: Array<Record<string, unknown> | string>
+}) {
+  return (
+    <div className="tag-group">
+      <h3>{title}</h3>
+      <div>
+        {items.length > 0 ? (
+          items.map((item, index) => <span key={`${title}-${index}`}>{formatItem(item)}</span>)
+        ) : (
+          <em>暂无数据</em>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function isPdfFile(file: File) {
   return file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+}
+
+function formatYears(value?: number | null) {
+  if (typeof value !== 'number') return null
+  return `${value} 年`
+}
+
+function formatItem(item: Record<string, unknown> | string) {
+  if (typeof item === 'string') return item
+
+  return Object.values(item)
+    .map((value) => (typeof value === 'string' || typeof value === 'number' ? String(value).trim() : ''))
+    .filter(Boolean)
+    .join(' / ')
 }
 
 function getUserFacingError(error: unknown) {

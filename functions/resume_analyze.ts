@@ -26,6 +26,17 @@ interface ResumeProfile {
   education: Array<Record<string, unknown> | string>
 }
 
+interface ParsedResumeCache {
+  profile: ResumeProfile
+  resumeText: string
+}
+
+interface CacheMetadata {
+  enabled: boolean
+  key: string
+  hit?: boolean
+}
+
 export default async function (ctx: FunctionContext) {
   setCorsHeaders(ctx)
 
@@ -61,6 +72,18 @@ export default async function (ctx: FunctionContext) {
     .digest('hex')
 
   const cacheKey = `resume:parse:${resumeId}`
+  const cachedResume = await getCacheJson<ParsedResumeCache>(cacheKey)
+  if (cachedResume) {
+    setStoredResume(resumeId, cachedResume.profile, cachedResume.resumeText)
+
+    return {
+      ok: true,
+      resumeId,
+      cache: getCacheMetadata(cacheKey, true),
+      profile: cachedResume.profile,
+    }
+  }
+
   const resumeText = await extractPdfText(buffer)
   if (!resumeText) {
     return jsonError(ctx, 422, 'PDF_PARSE_FAILED', 'Could not extract text from PDF')
@@ -75,14 +98,12 @@ export default async function (ctx: FunctionContext) {
   }
 
   setStoredResume(resumeId, profile, resumeText)
+  await setCacheJson(cacheKey, { profile, resumeText })
 
   return {
     ok: true,
     resumeId,
-    cache: {
-      enabled: Boolean(process.env.REDIS_URL),
-      key: cacheKey,
-    },
+    cache: getCacheMetadata(cacheKey, false),
     profile,
   }
 }
@@ -232,10 +253,20 @@ function decodePdfHex(value: string) {
 
 function cleanExtractedText(text: string) {
   return text
+    .replace(/\r\n?/g, '\n')
     .replace(/\u0000/g, '')
-    .replace(/[ \t]+/g, ' ')
+    .split('\n')
+    .map((line) => line.replace(/[ \t\f\v]+/g, ' ').trim())
+    .filter((line) => line && !isPageNoise(line))
+    .join('\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
+}
+
+function isPageNoise(line: string) {
+  return /^第\s*\d+\s*页\s*\/\s*共\s*\d+\s*页$/i.test(line)
+    || /^page\s*\d+\s*of\s*\d+$/i.test(line)
+    || /^[-_—=]{3,}$/.test(line)
 }
 
 function isPdf(fileName: string, mimeType: string) {
@@ -285,14 +316,19 @@ async function extractProfileWithDeepSeek(
       {
         role: 'system',
         content:
-          '你是招聘简历结构化解析助手。只返回合法 JSON，不要输出 Markdown。',
+          '你是招聘简历结构化解析助手。只返回合法 JSON，不要输出 Markdown；无法确认的信息返回 null 或空数组，不要编造。',
       },
       {
         role: 'user',
         content: [
-          '请从以下简历文本中提取 JSON，字段为：',
-          'name, phone, email, address, targetRole, expectedSalary, yearsOfExperience, skills, projects, education。',
-          '不存在的信息返回 null 或空数组。',
+          '请从以下多页简历文本中提取结构化 JSON。',
+          '必须包含以下字段：',
+          '1. 基本信息：name, phone, email, address。',
+          '2. 求职信息：targetRole, expectedSalary。',
+          '3. 背景信息：yearsOfExperience, skills, projects, education。',
+          'projects 数组中尽量保留项目名称、角色、技术栈、职责、成果。',
+          'education 数组中尽量保留学校、学历、专业、时间。',
+          'yearsOfExperience 返回数字；不存在的信息返回 null 或空数组。',
           '',
           resumeText.slice(0, 12000),
         ].join('\n'),
@@ -401,4 +437,64 @@ function objectOrStringArray(value: unknown) {
           typeof item === 'string' || (item && typeof item === 'object'),
       )
     : []
+}
+
+function getCacheMetadata(key: string, hit: boolean): CacheMetadata {
+  return {
+    enabled: Boolean(process.env.REDIS_URL),
+    hit,
+    key,
+  }
+}
+
+async function getCacheJson<T>(key: string) {
+  const redis = getRedisClient()
+  if (!redis) return null
+
+  try {
+    const value = await redis.get(key)
+    return value ? (JSON.parse(value) as T) : null
+  } catch (error) {
+    console.warn('Redis cache read failed', error)
+    return null
+  }
+}
+
+async function setCacheJson(key: string, value: unknown) {
+  const redis = getRedisClient()
+  if (!redis) return
+
+  try {
+    await redis.set(key, JSON.stringify(value), 'EX', getCacheTtlSeconds())
+  } catch (error) {
+    console.warn('Redis cache write failed', error)
+  }
+}
+
+function getRedisClient() {
+  const redisUrl = process.env.REDIS_URL
+  if (!redisUrl) return null
+
+  const globalStore = globalThis as typeof globalThis & {
+    __galileoRedis?: {
+      get(key: string): Promise<string | null>
+      set(key: string, value: string, mode: 'EX', ttlSeconds: number): Promise<unknown>
+    }
+  }
+
+  if (!globalStore.__galileoRedis) {
+    const Redis = require('ioredis')
+    globalStore.__galileoRedis = new Redis(redisUrl, {
+      connectTimeout: 1500,
+      enableOfflineQueue: false,
+      maxRetriesPerRequest: 1,
+    })
+  }
+
+  return globalStore.__galileoRedis
+}
+
+function getCacheTtlSeconds() {
+  const ttl = Number(process.env.REDIS_TTL_SECONDS)
+  return Number.isFinite(ttl) && ttl > 0 ? Math.round(ttl) : 86400
 }

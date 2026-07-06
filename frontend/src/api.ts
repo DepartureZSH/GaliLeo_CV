@@ -23,9 +23,12 @@ export interface ResumeProfile {
   phone: string | null
   email: string | null
   address: string | null
+  targetRole?: string | null
+  expectedSalary?: string | null
+  yearsOfExperience?: number | null
   skills: string[]
-  projects: Array<{ name?: string; description?: string } | string>
-  education: Array<{ school?: string; degree?: string; major?: string } | string>
+  projects: Array<Record<string, unknown> | string>
+  education: Array<Record<string, unknown> | string>
 }
 
 export interface AnalyzeResponse {
