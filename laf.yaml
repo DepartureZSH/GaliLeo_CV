@@ -3,5 +3,4 @@ name: GaliLeo_CV
 spec:
   runtime: node
   dependencies:
-    ioredis: 5.4.1
     pdf-parse: 1.1.1

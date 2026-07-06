@@ -1,4 +1,5 @@
 import { createHash } from 'crypto'
+import { connect } from 'net'
 
 interface ResumeProfile {
   name: string | null
@@ -345,12 +346,12 @@ function getRedisClient() {
   }
 
   if (!globalStore.__galileoRedis) {
-    const Redis = require('ioredis')
-    globalStore.__galileoRedis = new Redis(redisUrl, {
-      connectTimeout: 1500,
-      enableOfflineQueue: false,
-      maxRetriesPerRequest: 1,
-    })
+    try {
+      globalStore.__galileoRedis = createRedisClient(redisUrl)
+    } catch (error) {
+      console.warn('Redis client initialization failed', error)
+      return null
+    }
   }
 
   return globalStore.__galileoRedis
@@ -359,4 +360,96 @@ function getRedisClient() {
 function getCacheTtlSeconds() {
   const ttl = Number(process.env.REDIS_TTL_SECONDS)
   return Number.isFinite(ttl) && ttl > 0 ? Math.round(ttl) : 86400
+}
+
+function createRedisClient(redisUrl: string) {
+  return {
+    async get(key: string) {
+      const value = await runRedisCommand(redisUrl, ['GET', key])
+      return typeof value === 'string' ? value : null
+    },
+    async set(key: string, value: string, mode: 'EX', ttlSeconds: number) {
+      return runRedisCommand(redisUrl, ['SET', key, value, mode, String(ttlSeconds)])
+    },
+  }
+}
+
+function runRedisCommand(redisUrl: string, command: string[]) {
+  return new Promise<unknown>((resolve, reject) => {
+    const url = new URL(redisUrl)
+    const password = decodeURIComponent(url.password)
+    const username = decodeURIComponent(url.username)
+    const commands = password
+      ? [['AUTH', username || 'default', password], command]
+      : [command]
+    const expectedResponses = commands.length
+    const socket = connect({
+      host: url.hostname,
+      port: Number(url.port || 6379),
+      timeout: 2500,
+    })
+    let buffer = Buffer.alloc(0)
+    const responses: unknown[] = []
+
+    socket.on('connect', () => {
+      socket.write(commands.map(encodeRedisCommand).join(''))
+    })
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+
+      try {
+        while (responses.length < expectedResponses) {
+          const parsed = parseRedisResponse(buffer)
+          if (!parsed) return
+          responses.push(parsed.value)
+          buffer = buffer.subarray(parsed.offset)
+        }
+
+        socket.end()
+        resolve(responses[responses.length - 1])
+      } catch (error) {
+        socket.destroy()
+        reject(error)
+      }
+    })
+    socket.on('timeout', () => {
+      socket.destroy()
+      reject(new Error('Redis command timed out'))
+    })
+    socket.on('error', reject)
+  })
+}
+
+function encodeRedisCommand(args: string[]) {
+  return `*${args.length}\r\n${args
+    .map((arg) => {
+      const value = Buffer.from(arg)
+      return `$${value.length}\r\n${arg}\r\n`
+    })
+    .join('')}`
+}
+
+function parseRedisResponse(buffer: Buffer): { value: unknown; offset: number } | null {
+  const type = String.fromCharCode(buffer[0])
+  const lineEnd = buffer.indexOf('\r\n')
+  if (lineEnd < 0) return null
+  const line = buffer.subarray(1, lineEnd).toString()
+
+  if (type === '+') return { value: line, offset: lineEnd + 2 }
+  if (type === ':') return { value: Number(line), offset: lineEnd + 2 }
+  if (type === '-') throw new Error(`Redis error: ${line}`)
+
+  if (type === '$') {
+    const length = Number(line)
+    if (length === -1) return { value: null, offset: lineEnd + 2 }
+    const start = lineEnd + 2
+    const end = start + length
+    if (buffer.length < end + 2) return null
+    return {
+      value: buffer.subarray(start, end).toString(),
+      offset: end + 2,
+    }
+  }
+
+  throw new Error(`Unsupported Redis response type: ${type}`)
 }

@@ -11,7 +11,6 @@
     "vitest": "^1.6.1"
   },
   "dependencies": {
-    "ioredis": "5.4.1",
     "pdf-parse": "1.1.1"
   }
 }
