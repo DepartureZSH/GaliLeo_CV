@@ -9,13 +9,28 @@ interface UploadedFile {
   name?: string
   mimetype?: string
   type?: string
+  contentBase64?: string
   size?: number
+}
+
+interface ResumeProfile {
+  name: string | null
+  phone: string | null
+  email: string | null
+  address: string | null
+  targetRole?: string | null
+  expectedSalary?: string | null
+  yearsOfExperience?: number | null
+  skills: string[]
+  projects: Array<Record<string, unknown> | string>
+  education: Array<Record<string, unknown> | string>
 }
 
 export default async function (ctx: FunctionContext) {
   setCorsHeaders(ctx)
 
-  const file = getUploadedFile(ctx)
+  const body = normalizeBody(ctx.body)
+  const file = getUploadedFile(ctx, body)
   if (!file) {
     return jsonError(ctx, 400, 'INVALID_FILE', 'PDF resume file is required')
   }
@@ -37,11 +52,29 @@ export default async function (ctx: FunctionContext) {
   }
 
   const buffer = getFileBuffer(file)
+  if (!buffer) {
+    return jsonError(ctx, 400, 'INVALID_FILE', 'Uploaded PDF content is empty')
+  }
+
   const resumeId = createHash('sha256')
-    .update(buffer || fileName || String(Date.now()))
+    .update(buffer)
     .digest('hex')
 
   const cacheKey = `resume:parse:${resumeId}`
+  const resumeText = await extractPdfText(buffer)
+  if (!resumeText) {
+    return jsonError(ctx, 422, 'PDF_PARSE_FAILED', 'Could not extract text from PDF')
+  }
+
+  let profile: ResumeProfile
+  try {
+    profile = await extractProfileWithDeepSeek(resumeText, process.env)
+  } catch (error) {
+    console.error('DeepSeek resume extraction failed', error)
+    return jsonError(ctx, 502, 'DEEPSEEK_REQUEST_FAILED', 'DeepSeek resume extraction failed')
+  }
+
+  setStoredResume(resumeId, profile, resumeText)
 
   return {
     ok: true,
@@ -50,15 +83,7 @@ export default async function (ctx: FunctionContext) {
       enabled: Boolean(process.env.REDIS_URL),
       key: cacheKey,
     },
-    profile: {
-      name: null,
-      phone: null,
-      email: null,
-      address: null,
-      skills: [],
-      projects: [],
-      education: [],
-    },
+    profile,
   }
 }
 
@@ -72,7 +97,25 @@ function setCorsHeaders(ctx: FunctionContext) {
   ctx.response?.setHeader('Access-Control-Allow-Methods', 'GET,POST')
 }
 
-function getUploadedFile(ctx: FunctionContext): UploadedFile | null {
+function normalizeBody(body: unknown) {
+  if (typeof body === 'string') {
+    try {
+      return JSON.parse(body) as Record<string, unknown>
+    } catch {
+      return {}
+    }
+  }
+
+  return (body || {}) as Record<string, unknown>
+}
+
+function getUploadedFile(
+  ctx: FunctionContext,
+  body: Record<string, unknown>,
+): UploadedFile | null {
+  const bodyFile = getBodyFile(body)
+  if (bodyFile) return bodyFile
+
   const files = ctx.files
   if (!files) return null
   if (Array.isArray(files)) return (files[0] as UploadedFile | undefined) ?? null
@@ -83,7 +126,116 @@ function getUploadedFile(ctx: FunctionContext): UploadedFile | null {
 }
 
 function getFileBuffer(file: UploadedFile) {
+  if (typeof file.contentBase64 === 'string' && file.contentBase64.trim()) {
+    return Buffer.from(file.contentBase64, 'base64')
+  }
+
   return file.buffer || file.data || file.content || null
+}
+
+function getBodyFile(body: Record<string, unknown>): UploadedFile | null {
+  const contentBase64 = body.contentBase64
+  if (typeof contentBase64 !== 'string') return null
+
+  return {
+    contentBase64,
+    name: typeof body.fileName === 'string' ? body.fileName : undefined,
+    mimetype: typeof body.mimeType === 'string' ? body.mimeType : undefined,
+    size: typeof body.size === 'number' ? body.size : undefined,
+  }
+}
+
+async function extractPdfText(buffer: Buffer) {
+  const parsedText = await extractWithPdfParse(buffer)
+  if (parsedText) return cleanExtractedText(parsedText)
+
+  const fallbackText = extractReadablePdfText(buffer)
+  if (fallbackText) return cleanExtractedText(fallbackText)
+
+  return ''
+}
+
+async function extractWithPdfParse(buffer: Buffer) {
+  try {
+    const pdfParse = require('pdf-parse') as (
+      buffer: Buffer,
+    ) => Promise<{ text?: string }>
+    const parsed = await pdfParse(buffer)
+    return String(parsed.text || '')
+  } catch (error) {
+    console.warn('pdf-parse unavailable or failed, using fallback extractor', error)
+    return ''
+  }
+}
+
+function extractReadablePdfText(buffer: Buffer) {
+  const source = buffer.toString('latin1')
+  const parts: string[] = []
+
+  for (const match of source.matchAll(/\[((?:\s*(?:\((?:\\.|[^\\)])*\)|<[\da-fA-F\s]+>)[^\]]*)+)\]\s*TJ/g)) {
+    parts.push(decodePdfTextGroup(match[1]))
+  }
+
+  for (const match of source.matchAll(/\((?:\\.|[^\\)])*\)\s*Tj/g)) {
+    parts.push(decodePdfLiteral(match[0].replace(/\)\s*Tj$/, '').slice(1)))
+  }
+
+  if (parts.length === 0) {
+    for (const match of source.matchAll(/\((?:\\.|[^\\)]){3,}\)/g)) {
+      parts.push(decodePdfLiteral(match[0].slice(1, -1)))
+    }
+  }
+
+  return parts.join('\n')
+}
+
+function decodePdfTextGroup(value: string) {
+  const parts: string[] = []
+
+  for (const match of value.matchAll(/\((?:\\.|[^\\)])*\)|<[\da-fA-F\s]+>/g)) {
+    const token = match[0]
+    parts.push(token.startsWith('(')
+      ? decodePdfLiteral(token.slice(1, -1))
+      : decodePdfHex(token.slice(1, -1)))
+  }
+
+  return parts.join('')
+}
+
+function decodePdfLiteral(value: string) {
+  return value
+    .replace(/\\([0-7]{1,3})/g, (_, octal: string) => String.fromCharCode(Number.parseInt(octal, 8)))
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\n')
+    .replace(/\\t/g, '\t')
+    .replace(/\\b/g, '\b')
+    .replace(/\\f/g, '\f')
+    .replace(/\\([\\()])/g, '$1')
+}
+
+function decodePdfHex(value: string) {
+  const hex = value.replace(/\s+/g, '')
+  if (!hex) return ''
+
+  const normalized = hex.length % 2 === 0 ? hex : `${hex}0`
+  const bytes = Buffer.from(normalized, 'hex')
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    const chars: string[] = []
+    for (let index = 2; index + 1 < bytes.length; index += 2) {
+      chars.push(String.fromCharCode(bytes.readUInt16BE(index)))
+    }
+    return chars.join('')
+  }
+
+  return bytes.toString('utf8')
+}
+
+function cleanExtractedText(text: string) {
+  return text
+    .replace(/\u0000/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
 }
 
 function isPdf(fileName: string, mimeType: string) {
@@ -105,3 +257,148 @@ function jsonError(
   }
 }
 
+function setStoredResume(
+  resumeId: string,
+  profile: ResumeProfile,
+  resumeText: string,
+) {
+  const globalStore = globalThis as typeof globalThis & {
+    __galileoResumeStore?: Map<string, { profile: ResumeProfile; resumeText: string }>
+  }
+
+  if (!globalStore.__galileoResumeStore) {
+    globalStore.__galileoResumeStore = new Map()
+  }
+
+  globalStore.__galileoResumeStore.set(resumeId, { profile, resumeText })
+}
+
+async function extractProfileWithDeepSeek(
+  resumeText: string,
+  env: NodeJS.ProcessEnv,
+) {
+  const result = await callDeepSeekJson({
+    apiKey: requireEnv(env, 'DEEPSEEK_API_KEY'),
+    baseUrl: env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com',
+    model: env.DEEPSEEK_MODEL || 'deepseek-v4-flash',
+    messages: [
+      {
+        role: 'system',
+        content:
+          '你是招聘简历结构化解析助手。只返回合法 JSON，不要输出 Markdown。',
+      },
+      {
+        role: 'user',
+        content: [
+          '请从以下简历文本中提取 JSON，字段为：',
+          'name, phone, email, address, targetRole, expectedSalary, yearsOfExperience, skills, projects, education。',
+          '不存在的信息返回 null 或空数组。',
+          '',
+          resumeText.slice(0, 12000),
+        ].join('\n'),
+      },
+    ],
+  })
+
+  return normalizeProfile(result)
+}
+
+async function callDeepSeekJson(options: {
+  apiKey: string
+  baseUrl: string
+  model: string
+  messages: Array<{ role: 'system' | 'user'; content: string }>
+}) {
+  const response = await fetch(`${options.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${options.apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: options.model,
+      messages: options.messages,
+      response_format: { type: 'json_object' },
+      temperature: 0.2,
+    }),
+  })
+
+  const payload = (await response.json()) as {
+    choices?: Array<{ message?: { content?: unknown } }>
+  }
+
+  if (!response.ok) {
+    throw new Error(
+      `DeepSeek API error: ${response.status} ${JSON.stringify(payload).slice(0, 300)}`,
+    )
+  }
+
+  const content = payload?.choices?.[0]?.message?.content
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('DeepSeek API returned empty content')
+  }
+
+  try {
+    return JSON.parse(content)
+  } catch {
+    const match = content.match(/\{[\s\S]*\}/)
+    if (!match) throw new Error('DeepSeek API did not return JSON')
+    return JSON.parse(match[0])
+  }
+}
+
+function normalizeProfile(input: unknown): ResumeProfile {
+  const value = asRecord(input)
+
+  return {
+    name: nullableString(value.name),
+    phone: nullableString(value.phone),
+    email: nullableString(value.email),
+    address: nullableString(value.address),
+    targetRole: nullableString(value.targetRole),
+    expectedSalary: nullableString(value.expectedSalary),
+    yearsOfExperience: nullableNumber(value.yearsOfExperience),
+    skills: stringArray(value.skills),
+    projects: objectOrStringArray(value.projects),
+    education: objectOrStringArray(value.education),
+  }
+}
+
+function requireEnv(env: NodeJS.ProcessEnv, key: string) {
+  const value = env[key]
+  if (!value) throw new Error(`${key} is not configured`)
+  return value
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+}
+
+function nullableString(value: unknown) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function nullableNumber(value: unknown) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() && Number.isFinite(Number(value))) {
+    return Number(value)
+  }
+  return null
+}
+
+function stringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value
+        .map((item) => (typeof item === 'string' ? item.trim() : ''))
+        .filter(Boolean)
+    : []
+}
+
+function objectOrStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter(
+        (item) =>
+          typeof item === 'string' || (item && typeof item === 'object'),
+      )
+    : []
+}

@@ -1,8 +1,16 @@
 {
   "name": "laf-app",
   "description": "the app engine service of lat",
+  "scripts": {
+    "test": "vitest run functions",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
   "devDependencies": {
-    "@types/node": "^26.1.0",
-    "typescript": "^6.0.3"
+    "@types/node": "^18.11.15",
+    "typescript": "^5.0.2",
+    "vitest": "^1.6.1"
+  },
+  "dependencies": {
+    "pdf-parse": "1.1.1"
   }
 }

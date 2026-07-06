@@ -2,3 +2,5 @@ version: 1.0.0
 name: GaliLeo_CV
 spec:
   runtime: node
+  dependencies:
+    pdf-parse: 1.1.1

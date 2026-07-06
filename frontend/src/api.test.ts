@@ -11,7 +11,7 @@ describe('api client', () => {
     expect(getApiBaseUrl()).toBe('https://w8m6b6odq5.sealosbja.site')
   })
 
-  it('posts PDF uploads to /resume_analyze', async () => {
+  it('posts PDF uploads to /resume_analyze as base64 JSON', async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
       json: () =>
@@ -33,7 +33,15 @@ describe('api client', () => {
       'https://w8m6b6odq5.sealosbja.site/resume_analyze',
       expect.objectContaining({
         method: 'POST',
-        body: expect.any(FormData),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fileName: 'resume.pdf',
+          mimeType: 'application/pdf',
+          size: 6,
+          contentBase64: 'cmVzdW1l',
+        }),
       }),
     )
   })
@@ -59,4 +67,3 @@ describe('api client', () => {
     } satisfies Partial<ApiError>)
   })
 })
-

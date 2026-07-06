@@ -66,6 +66,7 @@ function App() {
       const matchResult = await matchResume(
         analyzeResult.resumeId,
         jobDescription.trim(),
+        analyzeResult.profile,
       )
       setMatch(matchResult)
     } catch (requestError) {

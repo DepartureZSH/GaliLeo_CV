@@ -2,6 +2,7 @@ export type ApiErrorCode =
   | 'DEEPSEEK_NOT_CONFIGURED'
   | 'INVALID_FILE'
   | 'INVALID_REQUEST'
+  | 'PDF_PARSE_FAILED'
   | 'NETWORK_ERROR'
   | 'UNKNOWN_ERROR'
 
@@ -64,25 +65,31 @@ export async function checkHealth() {
 }
 
 export async function uploadResume(file: File) {
-  const formData = new FormData()
-  formData.append('file', file)
-
   return requestJson<AnalyzeResponse>('/resume_analyze', {
     method: 'POST',
-    body: formData,
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      fileName: file.name,
+      mimeType: file.type || 'application/pdf',
+      size: file.size,
+      contentBase64: await fileToBase64(file),
+    }),
   })
 }
 
 export async function matchResume(
   resumeId: string,
   jobDescription: string,
+  profile?: ResumeProfile,
 ) {
   return requestJson<MatchResponse>('/resume_match', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ resumeId, jobDescription }),
+    body: JSON.stringify({ resumeId, jobDescription, profile }),
   })
 }
 
@@ -121,3 +128,14 @@ async function readJson(response: Response) {
   }
 }
 
+async function fileToBase64(file: File) {
+  const bytes = new Uint8Array(await file.arrayBuffer())
+  const chunkSize = 0x8000
+  let binary = ''
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize))
+  }
+
+  return btoa(binary)
+}
